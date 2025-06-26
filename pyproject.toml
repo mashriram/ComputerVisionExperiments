@@ -1,0 +1,21 @@
+[project]
+name = "face-algo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # Add face-alignment here. This will automatically pull in a
+    # modern version of numba and a compatible numpy.
+    "face-alignment>=1.4.1",
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.7",
+    "librosa>=0.11.0",
+    # Remove llvmlite, as numba will handle it.
+    "matplotlib>=3.9.0",
+    "timm>=1.0.15", # Updated for compatibility
+    "torch>=2.3.0", # Updated for compatibility
+    "torchvision>=0.18.0", # Updated for compatibility
+    # IMPORTANT: Remove the numpy constraint. Let the other packages decide
+    # which version they need.
+]
