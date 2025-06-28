@@ -375,3 +375,10 @@ if __name__ == "__main__":
     trainer = TrainingScript()
     for epoch in range(1, 101):
         trainer.train_epoch(epoch)
+
+    print("--- Training Complete ---")
+    torch.save(trainer.transformer.state_dict(), "transformer_model.pth")
+    torch.save(trainer.renderer.state_dict(), "renderer_model.pth")
+    torch.save(trainer.syncnet.state_dict(), "syncnet_model.pth")
+    print("--- Models Saved ---")
+    print("--- End of Training Script ---")
