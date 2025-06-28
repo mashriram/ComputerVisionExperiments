@@ -14,13 +14,11 @@ import timm
 USE_REAL_DATASET = True
 LRS2_DATA_ROOT = "lrs2/lrs2_rebuild/"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CHECKPOINT_PATH = "checkpoint.pth"  # Path to save/load checkpoints
+CHECKPOINT_PATH = "checkpoint_with_mouth.pth"  # New checkpoint file
 
 
-# --- Part 1: Data Pipeline (This is now correct and stable) ---
+# --- Part 1: The Data Pipeline (LRS2 Dataset Class) ---
 class LRS2Dataset(Dataset):
-    # ... (The LRS2Dataset class from the previous answer is correct. No changes needed here.)
-    # ... (For brevity, I'm omitting it, but it should be here in your final script)
     def __init__(self, root_dir, req_frames=32):
         super().__init__()
         self.root_dir = root_dir
@@ -30,6 +28,9 @@ class LRS2Dataset(Dataset):
             self.root_dir, "audio", "wav16k", "min", "tr", "mix"
         )
         self.landmarks_dir = os.path.join(self.root_dir, "landmark")
+        # --- NEW: Add path for mouth data ---
+        self.mouths_dir = os.path.join(self.root_dir, "mouths")
+
         self.file_list = self._get_file_list()
         if not self.file_list:
             raise RuntimeError(
@@ -40,11 +41,21 @@ class LRS2Dataset(Dataset):
         )
 
     def _get_file_list(self):
-        if not USE_REAL_DATASET:
-            return [("dummy_video", "dummy_audio")]
-        usable_basenames = {
-            os.path.splitext(f)[0] for f in os.listdir(self.videos_dir)
-        }.intersection({os.path.splitext(f)[0] for f in os.listdir(self.landmarks_dir)})
+        print(
+            "--- Verifying data integrity for ALL modalities (video, audio, landmarks, mouths) ---"
+        )
+        # --- NEW: Check for mouths in addition to other files ---
+        available_videos = {os.path.splitext(f)[0] for f in os.listdir(self.videos_dir)}
+        available_landmarks = {
+            os.path.splitext(f)[0] for f in os.listdir(self.landmarks_dir)
+        }
+        available_mouths = {os.path.splitext(f)[0] for f in os.listdir(self.mouths_dir)}
+
+        # A sample is usable only if all three visual components exist
+        usable_basenames = available_videos.intersection(
+            available_landmarks
+        ).intersection(available_mouths)
+
         potential_samples, audio_files = [], os.listdir(self.audio_dir)
         for audio_filename in audio_files:
             if not audio_filename.lower().endswith(".wav"):
@@ -58,19 +69,26 @@ class LRS2Dataset(Dataset):
                     potential_samples.append((s2, audio_filename))
             except IndexError:
                 continue
+
         valid_samples = []
         for video_base_name, audio_filename in tqdm(
             potential_samples, desc="Validating file content"
         ):
             video_path = os.path.join(self.videos_dir, video_base_name + ".mp4")
             landmark_path = os.path.join(self.landmarks_dir, video_base_name + ".npz")
+            mouth_path = os.path.join(
+                self.mouths_dir, video_base_name + ".npz"
+            )  # Path for mouth file
             try:
                 with np.load(landmark_path, allow_pickle=True) as d:
                     landmarks = d["data"] if "data" in d else d["arr_0"]
+                with np.load(mouth_path, allow_pickle=True) as d:
+                    mouths = d["data"] if "data" in d else d["arr_0"]
                 cap = cv2.VideoCapture(video_path)
                 if cap.isOpened():
                     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    if frame_count == len(landmarks):
+                    # Check consistency for all modalities
+                    if frame_count == len(landmarks) and frame_count == len(mouths):
                         valid_samples.append((video_base_name, audio_filename))
                 cap.release()
             except Exception:
@@ -88,12 +106,19 @@ class LRS2Dataset(Dataset):
         video_path = os.path.join(self.videos_dir, video_base_name + ".mp4")
         audio_path = os.path.join(self.audio_dir, audio_filename)
         landmark_path = os.path.join(self.landmarks_dir, video_base_name + ".npz")
+        mouth_path = os.path.join(self.mouths_dir, video_base_name + ".npz")
+
         with np.load(landmark_path, allow_pickle=True) as d:
             landmarks = d["data"] if "data" in d else d["arr_0"]
+        with np.load(mouth_path, allow_pickle=True) as d:
+            mouths = d["data"] if "data" in d else d["arr_0"]
+
         try:
             landmarks_reshaped = landmarks.reshape(landmarks.shape[0], 68, 2)
+            mouths_reshaped = mouths.reshape(mouths.shape[0], -1)  # Flatten mouth data
         except ValueError:
             return self.__getitem__((idx + 1) % len(self))
+
         cap = cv2.VideoCapture(video_path)
         frames = []
         while cap.isOpened():
@@ -103,6 +128,7 @@ class LRS2Dataset(Dataset):
             frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         cap.release()
         audio, sr = librosa.load(audio_path, sr=16000)
+
         num_frames = len(frames)
         if num_frames >= self.req_frames:
             start_frame = np.random.randint(0, num_frames - self.req_frames + 1)
@@ -110,15 +136,21 @@ class LRS2Dataset(Dataset):
             landmark_segment = landmarks_reshaped[
                 start_frame : start_frame + self.req_frames
             ]
+            mouth_segment = mouths_reshaped[start_frame : start_frame + self.req_frames]
         else:
             video_segment = list(frames)
             landmark_segment = list(landmarks_reshaped)
+            mouth_segment = list(mouths_reshaped)
             padding_needed = self.req_frames - num_frames
             video_segment.extend([frames[-1]] * padding_needed)
             landmark_segment.extend([landmarks_reshaped[-1]] * padding_needed)
+            mouth_segment.extend([mouths_reshaped[-1]] * padding_needed)
+
         landmark_segment = np.array(landmark_segment)
+        mouth_segment = np.array(mouth_segment)
         identity_frame = video_segment[0]
         identity_landmarks = landmark_segment[0]
+
         x_coords, y_coords = identity_landmarks[:, 0], identity_landmarks[:, 1]
         x_min, x_max = np.min(x_coords), np.max(x_coords)
         y_min, y_max = np.min(y_coords), np.max(y_coords)
@@ -132,6 +164,7 @@ class LRS2Dataset(Dataset):
         if identity_face.size == 0:
             return self._get_dummy_item()
         identity_face = cv2.resize(identity_face, (96, 96))
+
         audio_fps_ratio = 16000 / 25.0
         start_frame_audio_idx = (
             np.random.randint(0, num_frames) if num_frames > self.req_frames else 0
@@ -141,6 +174,7 @@ class LRS2Dataset(Dataset):
             int((start_frame_audio_idx + self.req_frames) * audio_fps_ratio),
         )
         audio_segment = audio[audio_start:audio_end]
+
         mel_spec = librosa.feature.melspectrogram(
             y=audio_segment, sr=16000, n_mels=80, hop_length=160, n_fft=400
         )
@@ -153,24 +187,27 @@ class LRS2Dataset(Dataset):
                 ((0, 0), (0, target_mel_len - mel_spec.shape[1])),
                 mode="constant",
             )
+
         landmark_flat = landmark_segment.reshape(self.req_frames, 136)
-        landmark_tensor = torch.from_numpy(landmark_flat).float()
+
         identity_image_tensor = (
             torch.from_numpy(identity_face).permute(2, 0, 1).float() / 255.0
         )
+        landmark_tensor = torch.from_numpy(landmark_flat).float()
+        mouth_tensor = torch.from_numpy(
+            mouth_segment
+        ).float()  # Mouth data is already flat
         mel_spec_tensor = torch.from_numpy(mel_spec.T).float()
-        return identity_image_tensor, landmark_tensor, mel_spec_tensor
+
+        return identity_image_tensor, landmark_tensor, mouth_tensor, mel_spec_tensor
 
     def _get_dummy_item(self):
-        identity_image = torch.rand(3, 96, 96)
-        landmarks = torch.rand(self.req_frames, 136)
-        mel_spec = torch.rand(self.req_frames * 4, 80)
-        return identity_image, landmarks, mel_spec
+        # ... (Dummy item generation for testing)
+        pass
 
 
-# --- Part 2: Model Architectures (Unchanged) ---
-# ... (PositionalEncoding, TalkingHeadTransformer, LandmarkRendererGAN, SyncNet classes go here) ...
-class PositionalEncoding(nn.Module):
+# --- Part 2: Model Architectures ---
+class PositionalEncoding(nn.Module):  # Unchanged
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -190,6 +227,7 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+# --- NEW: Modified Transformer with Two Prediction Heads ---
 class TalkingHeadTransformer(nn.Module):
     def __init__(
         self,
@@ -200,6 +238,7 @@ class TalkingHeadTransformer(nn.Module):
         dim_feedforward=2048,
     ):
         super().__init__()
+        # ... (Encoder part is the same)
         self.d_model = d_model
         self.identity_encoder = timm.create_model(
             "vit_base_patch16_224", pretrained=True, num_classes=d_model
@@ -218,6 +257,7 @@ class TalkingHeadTransformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_encoder_layers
         )
+        # Decoder for generating features from audio and past poses
         self.landmark_embedding = nn.Linear(136, d_model)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
@@ -228,7 +268,12 @@ class TalkingHeadTransformer(nn.Module):
         self.transformer_decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=num_decoder_layers
         )
-        self.output_layer = nn.Linear(d_model, 136)
+
+        # --- NEW: Two separate output layers ---
+        # Head 1: Predicts all 68 face landmarks (136 values)
+        self.output_layer_full = nn.Linear(d_model, 136)
+        # Head 2: Predicts only mouth landmarks (assuming 20 landmarks * 2 coords = 40 values)
+        self.output_layer_mouth = nn.Linear(d_model, 40)
 
     def forward(self, identity_image, audio_spectrogram, target_landmarks):
         identity_image_resized = torch.nn.functional.interpolate(
@@ -239,11 +284,18 @@ class TalkingHeadTransformer(nn.Module):
         audio_memory = self.transformer_encoder(self.pos_encoder(audio_embedded))
         tgt_embedded = self.landmark_embedding(target_landmarks)
         tgt_pos_encoded = self.pos_encoder(tgt_embedded)
-        output = self.transformer_decoder(tgt_pos_encoded, memory=audio_memory)
-        predicted_landmarks = self.output_layer(output)
-        return predicted_landmarks
+
+        # The decoder output contains the rich features for prediction
+        decoder_output = self.transformer_decoder(tgt_pos_encoded, memory=audio_memory)
+
+        # Get predictions from both heads
+        predicted_full_landmarks = self.output_layer_full(decoder_output)
+        predicted_mouth_landmarks = self.output_layer_mouth(decoder_output)
+
+        return predicted_full_landmarks, predicted_mouth_landmarks
 
 
+# ... (Renderer and SyncNet classes are unchanged) ...
 class LandmarkRendererGAN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -291,39 +343,30 @@ class SyncNet(nn.Module):
         return torch.rand(1, device=DEVICE)
 
 
-# --- Part 3: The Full Training Script Logic with Save/Load/Optimizations ---
+# --- Part 3: The Full Training Script Logic with Mouth Loss ---
 class TrainingScript:
     def __init__(self, checkpoint_path=None):
         self.transformer = TalkingHeadTransformer().to(DEVICE)
         self.renderer = LandmarkRendererGAN().to(DEVICE)
-        self.syncnet = SyncNet().to(
-            DEVICE
-        )  # In a real project, load pre-trained weights
-
+        self.syncnet = SyncNet().to(DEVICE)
         self.dataset = LRS2Dataset(LRS2_DATA_ROOT)
-        # **STRATEGY 1: For debugging, use a small subset of the data**
-        # subset_indices = list(range(500)) # Use only the first 500 samples
-        # train_subset = torch.utils.data.Subset(self.dataset, subset_indices)
-        # self.dataloader = DataLoader(train_subset, batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
-
-        # For full training:
         self.dataloader = DataLoader(
             self.dataset, batch_size=4, shuffle=True, num_workers=4, pin_memory=True
         )
-
         self.transformer_optim = optim.AdamW(self.transformer.parameters(), lr=1e-4)
         self.renderer_optim = optim.AdamW(self.renderer.parameters(), lr=1e-4)
         self.l1_loss = nn.L1Loss()
 
-        # **STRATEGY 2: Automatic Mixed Precision (AMP) for speed and memory**
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
+        # --- NEW: Add a weight for the specialized mouth loss ---
+        self.mouth_loss_weight = 0.5
 
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
         self.start_epoch = 1
         if checkpoint_path and os.path.isfile(checkpoint_path):
             self.load_checkpoint(checkpoint_path)
 
+    # ... (save_checkpoint and load_checkpoint methods are unchanged) ...
     def save_checkpoint(self, epoch):
-        # We save the models, optimizers, and current epoch
         state = {
             "epoch": epoch,
             "transformer_state_dict": self.transformer.state_dict(),
@@ -351,36 +394,49 @@ class TrainingScript:
     def train_epoch(self, epoch):
         loop = tqdm(self.dataloader, desc=f"Epoch {epoch}")
         for batch in loop:
-            identity_image, gt_landmarks, mel_spec = [
+            # --- NEW: Unpack the mouth data ---
+            identity_image, gt_full_landmarks, gt_mouth_landmarks, mel_spec = [
                 item.to(DEVICE, non_blocking=True) for item in batch
             ]
 
             with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
                 # --- Train Transformer ---
-                transformer_target = gt_landmarks[:, 1:]
-                transformer_input = gt_landmarks[:, :-1]
-                video_len = transformer_input.shape[1]
+                full_landmarks_target = gt_full_landmarks[:, 1:]
+                full_landmarks_input = gt_full_landmarks[:, :-1]
+                mouth_landmarks_target = gt_mouth_landmarks[
+                    :, 1:
+                ]  # Also create target for mouth
+
+                video_len = full_landmarks_input.shape[1]
                 mel_spec_aligned = torch.nn.functional.interpolate(
                     mel_spec.transpose(1, 2),
                     size=video_len,
                     mode="linear",
                     align_corners=False,
                 ).transpose(1, 2)
-                predicted_landmarks = self.transformer(
-                    identity_image, mel_spec_aligned, transformer_input
+
+                # --- NEW: Model now returns two predictions ---
+                predicted_full, predicted_mouth = self.transformer(
+                    identity_image, mel_spec_aligned, full_landmarks_input
                 )
-                loss_l1 = self.l1_loss(predicted_landmarks, transformer_target)
+
+                # --- NEW: Calculate two separate losses ---
+                loss_full = self.l1_loss(predicted_full, full_landmarks_target)
+                loss_mouth = self.l1_loss(predicted_mouth, mouth_landmarks_target)
+
+                # Combine the losses
+                total_transformer_loss = loss_full + self.mouth_loss_weight * loss_mouth
 
             self.transformer_optim.zero_grad(set_to_none=True)
-            self.scaler.scale(loss_l1).backward()
+            self.scaler.scale(
+                total_transformer_loss
+            ).backward()  # Backpropagate the combined loss
             self.scaler.step(self.transformer_optim)
             self.scaler.update()
 
             with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
-                # --- Train Renderer ---
-                rendered_frames = self.renderer(
-                    identity_image, predicted_landmarks.detach()
-                )
+                # --- Train Renderer (uses only the full landmarks) ---
+                rendered_frames = self.renderer(identity_image, predicted_full.detach())
                 gt_frames_for_renderer = identity_image.unsqueeze(1).repeat(
                     1, rendered_frames.size(1), 1, 1, 1
                 )
@@ -400,18 +456,18 @@ class TrainingScript:
             self.scaler.update()
 
             loop.set_postfix(
-                loss_lm=loss_l1.item(), loss_render=total_renderer_loss.item()
+                loss_full=loss_full.item(),
+                loss_mouth=loss_mouth.item(),
+                loss_render=total_renderer_loss.item(),
             )
 
 
-# --- Main Execution Block ---
+# --- Part 6: Main Execution Block ---
 if __name__ == "__main__":
     if DEVICE == "cuda":
         torch.multiprocessing.set_start_method("spawn", force=True)
-
-    print(f"--- Starting Training on {DEVICE} ---")
+    print(f"--- Starting Real Training on {DEVICE} ---")
     trainer = TrainingScript(checkpoint_path=CHECKPOINT_PATH)
-    for epoch in range(trainer.start_epoch, 101):  # Start from last epoch
+    for epoch in range(trainer.start_epoch, 101):
         trainer.train_epoch(epoch)
-        # Save a checkpoint at the end of each epoch
         trainer.save_checkpoint(epoch)
